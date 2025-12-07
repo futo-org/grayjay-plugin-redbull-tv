@@ -1123,8 +1123,11 @@ function getChannelVideos(url, pager) {
 
     if (type === "shows") {
         return fetchShowVideos(slug);
-    } else if (type === "event-profiles" || type === "person-profiles") {
-        // We need the ID first
+    } else if (type === "person-profiles") {
+        // For athletes, use slug-based filtering to get videos specifically tagged with the athlete
+        return fetchAthleteVideos(slug, 0);
+    } else if (type === "event-profiles") {
+        // For events, use the ID-based related-to API
         const metadata = fetchChannelMetadata(type, slug, locale);
         if (!metadata) throw new ScriptException("Channel not found");
         return fetchRelatedVideos(metadata.id, 0);
@@ -1228,6 +1231,57 @@ function fetchRelatedVideos(id, page) {
     
     const hasMore = items.length >= ITEMS_PER_PAGE;
     return new RedBullPager(videos, hasMore, "related_videos", page + 1, id);
+}
+
+/**
+ * Fetches videos specifically tagged with an athlete using tag-based filtering.
+ * This uses two approaches:
+ * 1. First tries relationships.tags filter to get videos tagged with the athlete
+ *    (used for athletes with many videos like Brandon Semenuk)
+ * 2. If that returns empty, falls back to the editorsPick tile endpoint
+ *    (used for athletes with curated featured content like Angel Daleman)
+ * 
+ * @param {string} slug - The athlete's URL slug (e.g., "angel-daleman", "brandon-semenuk")
+ * @param {number} page - Page number for pagination
+ * @returns {RedBullPager} Pager containing athlete's videos
+ */
+function fetchAthleteVideos(slug, page) {
+    const offset = page * ITEMS_PER_PAGE;
+    
+    // First try: Use tag-based filtering to get videos specifically tagged with this athlete
+    const tagUrl = `${API_BASE_URL}/feed/en-INT?filter[relationships.tags]=rrn:slug:person-profiles:${slug}&filter[type]=rrn:content:shows,rrn:content:films,rrn:content:episode-videos,rrn:content:videos&scoring=featuredFresh&score.featuredFresh.subType=rail2&page[limit]=${ITEMS_PER_PAGE}&page[offset]=${offset}&rb3Schema=v1:cardList`;
+    
+    const tagResponse = httpGET({ url: tagUrl });
+    if (tagResponse.isOk) {
+        const items = tagResponse.body?.data || [];
+        if (items.length > 0) {
+            const videos = items
+                .map(item => createPlatformVideo(item))
+                .filter(v => v !== null);
+            
+            const hasMore = items.length >= ITEMS_PER_PAGE;
+            return new RedBullPager(videos, hasMore, "athlete_videos", page + 1, slug);
+        }
+    }
+    
+    // Fallback: Use the editorsPick tile endpoint for athletes with curated featured content
+    // This endpoint returns videos that are specifically featured for this athlete
+    if (page === 0) {
+        const tileUrl = `${API_BASE_URL}/feed/en-INT/related-to/rrn:slug:person-profiles:${slug}?scoring=featured&score.featured.subType=editorsPick&score.featured.localeMixing=en-INT&disableUsageRestrictions=true&filter[type]=episode-videos,films,videos,live-videos,recap-videos&page[limit]=${ITEMS_PER_PAGE}&rb3Schema=v1:cardList`;
+        
+        const tileResponse = httpGET({ url: tileUrl });
+        if (tileResponse.isOk) {
+            const items = tileResponse.body?.data || [];
+            const videos = items
+                .map(item => createPlatformVideo(item))
+                .filter(v => v !== null);
+            
+            // editorsPick typically returns just a few items, so no pagination
+            return new RedBullPager(videos, false, "athlete_videos", page + 1, slug);
+        }
+    }
+    
+    return new RedBullPager([], false, "athlete_videos", page, slug);
 }
 
 function fetchRelatedPlaylists(id, page) {
