@@ -214,6 +214,13 @@ source.getChannel = function(url) {
     const metadata = fetchChannelMetadata(type, slug, locale);
     if (!metadata) throw new ScriptException("Channel not found");
 
+    // For athletes, fetch and include social links
+    let links = { "Red Bull TV": url };
+    if (type === "person-profiles") {
+        const socialLinks = fetchAthleteSocialLinks(slug, locale);
+        links = Object.assign({}, socialLinks, links);
+    }
+
     return new PlatformChannel({
         id: new PlatformID(PLATFORM, metadata.id, config.id || ""),
         name: metadata.title,
@@ -222,7 +229,7 @@ source.getChannel = function(url) {
         subscribers: 0,
         description: metadata.description,
         url: url,
-        links: {}
+        links: links
     });
 };
 
@@ -1186,6 +1193,72 @@ function fetchChannelMetadata(type, slug, locale = "en-INT") {
         image: image,
         videoCount: data.nrOfEpisodes || -1
     };
+}
+
+/**
+ * Fetches social media links for an athlete using the v2:personHero schema.
+ * Returns a links object suitable for PlatformChannel.
+ * 
+ * @param {string} slug - The athlete's URL slug (e.g., "brandon-semenuk")
+ * @param {string} locale - API locale format (e.g., "en-INT")
+ * @returns {Object} Links object mapping platform names to URLs
+ * 
+ * Supported platforms: x (Twitter), facebook, instagram, youtube, tiktok, twitch, etc.
+ */
+function fetchAthleteSocialLinks(slug, locale = "en-INT") {
+    const url = `${API_BASE_URL}/feed/${locale}?filter[type]=person-profiles&filter[uriSlug]=${slug}&page[limit]=1&disableUsageRestrictions=true&rb3Schema=v2:personHero`;
+    const response = httpGET({ url: url });
+    
+    if (!response.isOk) {
+        return {};
+    }
+    
+    const data = response.body?.data;
+    if (!data || !data.socialLinks) {
+        return {};
+    }
+    
+    const links = {};
+    
+    // Map platform identifiers to display names
+    const platformNames = {
+        'x': 'X (Twitter)',
+        'twitter': 'X (Twitter)',
+        'facebook': 'Facebook',
+        'instagram': 'Instagram',
+        'youtube': 'YouTube',
+        'tiktok': 'TikTok',
+        'twitch': 'Twitch',
+        'linkedin': 'LinkedIn',
+        'snapchat': 'Snapchat',
+        'threads': 'Threads',
+        'spotify': 'Spotify',
+        'soundcloud': 'SoundCloud',
+        'web': 'Website',
+        'website': 'Website',
+        'discord': 'Discord',
+        'reddit': 'Reddit',
+        'strava': 'Strava'
+    };
+    
+    for (const link of data.socialLinks) {
+        if (link.platform && link.href) {
+            const displayName = platformNames[link.platform.toLowerCase()] || capitalizeFirst(link.platform);
+            links[displayName] = link.href;
+        }
+    }
+    
+    return links;
+}
+
+/**
+ * Capitalizes the first letter of a string.
+ * @param {string} str - The string to capitalize
+ * @returns {string} The string with first letter capitalized
+ */
+function capitalizeFirst(str) {
+    if (!str) return '';
+    return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
 }
 
 function fetchShowVideos(slug) {
