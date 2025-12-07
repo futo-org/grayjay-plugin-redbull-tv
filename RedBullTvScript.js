@@ -211,15 +211,28 @@ source.getChannel = function(url) {
     const { type, slug, locale } = parseChannelUrl(url);
     if (!type || !slug) throw new ScriptException("Invalid channel URL");
 
+    // For athletes, batch both metadata and social links requests together
+    if (type === "person-profiles") {
+        const result = fetchAthleteChannelData(slug, locale);
+        if (!result.metadata) throw new ScriptException("Channel not found");
+        
+        let links = Object.assign({}, result.socialLinks, { "Red Bull TV": url });
+        
+        return new PlatformChannel({
+            id: new PlatformID(PLATFORM, result.metadata.id, config.id || ""),
+            name: result.metadata.title,
+            thumbnail: result.metadata.image,
+            banner: result.metadata.image,
+            subscribers: 0,
+            description: result.metadata.description,
+            url: url,
+            links: links
+        });
+    }
+
+    // For non-athlete channels, just fetch metadata
     const metadata = fetchChannelMetadata(type, slug, locale);
     if (!metadata) throw new ScriptException("Channel not found");
-
-    // For athletes, fetch and include social links
-    let links = { "Red Bull TV": url };
-    if (type === "person-profiles") {
-        const socialLinks = fetchAthleteSocialLinks(slug, locale);
-        links = Object.assign({}, socialLinks, links);
-    }
 
     return new PlatformChannel({
         id: new PlatformID(PLATFORM, metadata.id, config.id || ""),
@@ -229,7 +242,7 @@ source.getChannel = function(url) {
         subscribers: 0,
         description: metadata.description,
         url: url,
-        links: links
+        links: { "Red Bull TV": url }
     });
 };
 
@@ -1193,6 +1206,90 @@ function fetchChannelMetadata(type, slug, locale = "en-INT") {
         image: image,
         videoCount: data.nrOfEpisodes || -1
     };
+}
+
+/**
+ * Fetches both metadata and social links for an athlete in a single batched request.
+ * This is more efficient than making two separate requests sequentially.
+ * 
+ * @param {string} slug - The athlete's URL slug (e.g., "brandon-semenuk")
+ * @param {string} locale - API locale format (e.g., "en-INT")
+ * @returns {Object} Object containing { metadata, socialLinks }
+ */
+function fetchAthleteChannelData(slug, locale = "en-INT") {
+    const metadataUrl = `${API_BASE_URL}/feed/${locale}?filter[type]=person-profiles&filter[uriSlug]=${slug}&page[limit]=1&rb3Schema=v1:cardList`;
+    const socialLinksUrl = `${API_BASE_URL}/feed/${locale}?filter[type]=person-profiles&filter[uriSlug]=${slug}&page[limit]=1&disableUsageRestrictions=true&rb3Schema=v2:personHero`;
+    
+    const [metadataResp, socialLinksResp] = http.batch()
+        .GET(metadataUrl, HEADERS)
+        .GET(socialLinksUrl, HEADERS)
+        .execute();
+    
+    // Parse metadata
+    let metadata = null;
+    if (metadataResp.isOk) {
+        try {
+            const metadataData = JSON.parse(metadataResp.body);
+            const data = metadataData?.data?.[0];
+            if (data) {
+                const title = data.content?.title || data.title;
+                const description = data.content?.standfirst || data.content?.description || "";
+                const imageBase = extractImage(data);
+                const image = processImageUrl(imageBase, 640, 360);
+                
+                metadata = {
+                    id: data.id,
+                    title: title,
+                    description: description,
+                    image: image,
+                    videoCount: data.nrOfEpisodes || -1
+                };
+            }
+        } catch (e) {
+            // Ignore parse errors
+        }
+    }
+    
+    // Parse social links
+    const socialLinks = {};
+    if (socialLinksResp.isOk) {
+        try {
+            const socialData = JSON.parse(socialLinksResp.body);
+            const data = socialData?.data;
+            if (data && data.socialLinks) {
+                const platformNames = {
+                    'x': 'X (Twitter)',
+                    'twitter': 'X (Twitter)',
+                    'facebook': 'Facebook',
+                    'instagram': 'Instagram',
+                    'youtube': 'YouTube',
+                    'tiktok': 'TikTok',
+                    'twitch': 'Twitch',
+                    'linkedin': 'LinkedIn',
+                    'snapchat': 'Snapchat',
+                    'threads': 'Threads',
+                    'spotify': 'Spotify',
+                    'soundcloud': 'SoundCloud',
+                    'web': 'Website',
+                    'website': 'Website',
+                    'discord': 'Discord',
+                    'reddit': 'Reddit',
+                    'strava': 'Strava'
+                };
+                
+                for (const link of data.socialLinks) {
+                    if (link.platform && link.href) {
+                        const displayName = platformNames[link.platform.toLowerCase()] || capitalizeFirst(link.platform);
+                        socialLinks[displayName] = link.href;
+                    }
+                }
+            }
+        } catch (e) {
+            // Ignore parse errors
+        }
+    }
+    
+    return { metadata, socialLinks };
 }
 
 /**
