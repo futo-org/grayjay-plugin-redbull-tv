@@ -9,7 +9,7 @@
   "iconUrl": "./RedBullTvIcon.png",
   "scriptUrl": "./RedBullTvScript.js",
   "repositoryUrl": "https://gitlab.futo.org/videostreaming/plugins/redbull-tv",
-  "configUrl": "https://plugins.grayjay.app/RedbullTv/RedBullTvConfig.json",
+  "sourceUrl": "https://plugins.grayjay.app/RedbullTv/RedBullTvConfig.json",
   "scriptSignature": "",
   "scriptPublicKey": "",
   "packages": [
