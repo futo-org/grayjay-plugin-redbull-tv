@@ -10,7 +10,6 @@ const PLAYER_API_URL = "https://api-player.redbull.com/rbcom/videoresource";
 const PODCAST_PLAYER_API_URL = "https://api-player.redbull.com/rbcom/podcast";
 
 const HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/vnd.rbgemc+json,application/json;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9'
 };
