@@ -5,6 +5,7 @@
 
 const PLATFORM = "Red Bull TV";
 const BASE_URL = "https://www.redbull.com";
+const DEFAULT_THUMBNAIL_URL = `https://www.redbull.com/favicon.ico`;
 const API_BASE_URL = "https://www.redbull.com/v3/api/graphql/v1/v3";
 const PLAYER_API_URL = "https://api-player.redbull.com/rbcom/videoresource";
 const PODCAST_PLAYER_API_URL = "https://api-player.redbull.com/rbcom/podcast";
@@ -36,6 +37,33 @@ const NON_VIDEO_ENTITY_TYPES = ['athlete', 'team', 'story'];
 // Pagination
 const ITEMS_PER_PAGE = 20;
 const PREFERRED_LOCALE = 'en-INT';
+
+// ============================================================================
+// ATHLETE AUTHOR OVERRIDE FLOW
+// ============================================================================
+//
+// When browsing an athlete's channel, videos should show
+// that athlete as the author. However, some videos (like "Winter Heroes" episodes)
+// have multiple related athletes, making it ambiguous which one to display.
+//
+// Solution: Pass the athlete ID as a URL query param hint from channel to video.
+//
+// Flow:
+// 1. getChannelContents() fetches athlete metadata and creates a PlatformAuthorLink
+// 2. fetchAthleteVideos() receives this author and passes it to createPlatformVideo()
+// 3. createPlatformVideo() appends ?athlete=<uuid> to video URLs when author is provided
+// 4. When user opens video, getContentDetails() extracts the athlete UUID from URL
+// 5. getVideoTypeContentDetails() passes UUID to fetchPlayerAndAthlete()
+// 6. fetchPlayerAndAthlete() fetches that specific athlete instead of guessing
+//
+// Without the hint (e.g., from getHome), videos show "Red Bull TV" as author.
+//
+// Key functions:
+// - createPlatformVideo(): Adds ?athlete=<uuid> to URL
+// - getContentDetails(): Extracts athlete UUID from URL
+// - fetchPlayerAndAthlete(): Fetches specific athlete if UUID provided
+//
+// ============================================================================
 
 // ============================================================================
 // URL MATCHING REGEXES
@@ -125,7 +153,16 @@ let state = {};
  */
 source.enable = function (conf, settings, saveStateStr) {
     config = conf ?? {};
-    state = saveStateStr ? JSON.parse(saveStateStr) : {};
+    if (!saveStateStr) {
+        state = {};
+    } else {
+        try {
+            state = JSON.parse(saveStateStr);
+        } catch (e) {
+            log("Failed to parse saved state: " + formatError(e));
+            state = {};
+        }
+    }
 };
 
 
@@ -198,8 +235,8 @@ source.getChannel = function(url) {
         return new PlatformChannel({
             id: new PlatformID(PLATFORM, "RedBull", config.id || ""),
             name: "Red Bull TV",
-            thumbnail: "https://www.redbull.com/favicon.ico",
-            banner: "https://www.redbull.com/favicon.ico",
+            thumbnail: DEFAULT_THUMBNAIL_URL,
+            banner: "",
             subscribers: 0,
             description: "Red Bull TV",
             url: url,
@@ -256,7 +293,25 @@ source.getChannelContents = function(url, type, order, filters) {
     if (type === Type.Feed.Playlists) {
         return source.getChannelPlaylists(url);
     }
-    return getChannelVideos(url);
+
+    // Get channel info to use as author for videos
+    let author = null;
+    try {
+        const channel = source.getChannel(url);
+        if (channel) {
+            author = new PlatformAuthorLink(
+                channel.id,
+                channel.name,
+                channel.url,
+                channel.thumbnail
+            );
+        }
+    } catch (e) {
+        log("Failed to build channel author: " + formatError(e));
+        // Fall back to default author if channel fetch fails
+    }
+
+    return getChannelVideos(url, null, author);
 };
 
 source.getChannelPlaylists = function(url, pager) {
@@ -414,20 +469,25 @@ source.isContentDetailsUrl = function(url) {
  */
 source.getContentDetails = function(url) {
     const path = url.replace(BASE_URL, "");
-    
+
+    // Extract athlete UUID hint from query param if present
+    // URL format: ...?athlete=<uuid> or ...&athlete=<uuid>
+    const athleteMatch = url.match(/[?&]athlete=([^&]+)/);
+    const athleteUuid = athleteMatch ? athleteMatch[1] : null;
+
     const podcastMatch = path.match(PODCAST_EPISODE_REGEX);
     if (podcastMatch) {
         return getPodcastContentDetails(url, podcastMatch[1], podcastMatch[2]);
     }
-    
+
     const episodeMatch = path.match(SHOW_EPISODE_REGEX);
     if (episodeMatch) {
-        return getVideoTypeContentDetails(url, episodeMatch[1], episodeMatch[2], 'episode-videos');
+        return getVideoTypeContentDetails(url, episodeMatch[1], episodeMatch[2], 'episode-videos', athleteUuid);
     }
-    
+
     const videosMatch = path.match(VIDEO_URL_REGEX);
     if (videosMatch) {
-        return getVideoTypeContentDetails(url, videosMatch[1], videosMatch[2], 'videos');
+        return getVideoTypeContentDetails(url, videosMatch[1], videosMatch[2], 'videos', athleteUuid);
     }
     
     const configUrl = `${BASE_URL}/v3/config/pages?url=${path}`;
@@ -528,11 +588,17 @@ source.getContentDetails = function(url) {
 
     const subtitles = extractSubtitles(playerData);
 
+    // Only fetch athlete if UUID hint is provided (consistent with videos/episodes flow)
+    const authorFallback = defaultAuthor();
+    const author = athleteUuid
+        ? (fetchAthleteByUuid(athleteUuid, getLocaleFromId(contentId)) || authorFallback)
+        : authorFallback;
+
     const result = new PlatformVideoDetails({
         id: new PlatformID(PLATFORM, contentId, config.id || ""),
         name: title,
         thumbnails: thumbnails,
-        author: new PlatformAuthorLink(new PlatformID(PLATFORM, "RedBull", config.id || ""), "Red Bull TV", BASE_URL, "https://www.redbull.com/favicon.ico"),
+        author: author,
         uploadDate: publishedDate,
         duration: duration,
         viewCount: 0,
@@ -550,6 +616,15 @@ source.getContentDetails = function(url) {
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+function defaultAuthor(name = "Red Bull TV") {
+    return new PlatformAuthorLink(
+        new PlatformID(PLATFORM, "RedBull", config.id || ""),
+        name,
+        BASE_URL,
+        DEFAULT_THUMBNAIL_URL
+    );
+}
 
 /**
  * Extracts subtitle tracks from video player API response.
@@ -729,7 +804,7 @@ function getAudioContentDetails(url, audioId, title, description, thumbnails, du
         id: new PlatformID(PLATFORM, audioId, config.id || ""),
         name: title,
         thumbnails: thumbnails,
-        author: new PlatformAuthorLink(new PlatformID(PLATFORM, "RedBull", config.id || ""), "Red Bull Podcasts", BASE_URL, "https://www.redbull.com/favicon.ico"),
+        author: defaultAuthor("Red Bull Podcasts"),
         uploadDate: publishedDate,
         duration: duration,
         viewCount: 0,
@@ -766,18 +841,18 @@ function getAudioContentDetails(url, audioId, title, description, thumbnails, du
  *   (e.g., /gr-el/episodes/..., /lat-es/videos/...) but the GraphQL query API
  *   works correctly when we convert the locale format and query directly.
  */
-function getVideoTypeContentDetails(url, urlLocale, slug, contentType) {
+function getVideoTypeContentDetails(url, urlLocale, slug, contentType, athleteUuid) {
     // Convert URL locale (e.g., 'fr-ca', 'lat-es') to API locale format (e.g., 'fr-CA', 'es-LAT')
     const apiLocale = convertUrlLocaleToApiLocale(urlLocale);
-    
+
     // Query the GraphQL API directly
     const queryUrl = `${API_BASE_URL}/query/${apiLocale}?filter[type]=${contentType}&filter[uriSlug]=${encodeURIComponent(slug)}&page[limit]=1&rb3Schema=v1:cardList`;
-    
+
     const queryResp = httpGET({ url: queryUrl });
     if (!queryResp.isOk || !queryResp.body.data || queryResp.body.data.length === 0) {
         throw new ScriptException(`Content not found for type '${contentType}'`);
     }
-    
+
     const item = queryResp.body.data[0];
     const videoId = item.id;
     const title = item.content?.title || item.title || "Unknown Title";
@@ -786,26 +861,32 @@ function getVideoTypeContentDetails(url, urlLocale, slug, contentType) {
     const thumbnails = createThumbnails(image);
     const duration = item.duration || 0;
     const publishedDate = extractPublishedDate(item);
-    
-    // Fetch HLS stream and subtitle data from video player API
-    const playerData = fetchVideoPlayerData(videoId);
-    const hlsUrl = playerData.videoUrl;
-    
+
+    // Batch fetch player data and related athlete in parallel for better performance
+    // Pass athleteUuid hint to fetch the correct athlete when video has multiple related athletes
+    const { playerData, athlete } = fetchPlayerAndAthlete(videoId, athleteUuid);
+    if (!playerData?.videoUrl) {
+        throw new ScriptException("Failed to fetch video sources");
+    }
+
     const sources = [
         new HLSSource({
             name: "HLS",
-            url: hlsUrl,
+            url: playerData.videoUrl,
             duration: duration
         })
     ];
 
     const subtitles = extractSubtitles(playerData);
 
+    // Use athlete as author if found, otherwise fall back to Red Bull TV
+    const author = athlete || defaultAuthor();
+
     const result = new PlatformVideoDetails({
         id: new PlatformID(PLATFORM, videoId, config.id || ""),
         name: title,
         thumbnails: thumbnails,
-        author: new PlatformAuthorLink(new PlatformID(PLATFORM, "RedBull", config.id || ""), "Red Bull TV", BASE_URL, "https://www.redbull.com/favicon.ico"),
+        author: author,
         uploadDate: publishedDate,
         duration: duration,
         viewCount: 0,
@@ -865,6 +946,7 @@ source.getContentRecommendations = function(url, initialData) {
             const details = source.getContentDetails(url);
             videoId = details.id.value;
         } catch (e) {
+            log("getContentDetails failed for recommendations: " + formatError(e));
             return new RedBullPager([], false, "related_videos", 0);
         }
     }
@@ -877,14 +959,21 @@ source.getContentRecommendations = function(url, initialData) {
 // --- Pagers ---
 
 class RedBullPager extends VideoPager {
-    constructor(results, hasMore, type, page, context = null, videosOnly = false) {
+    constructor(results, hasMore, type, page, context = null, videosOnlyOrAuthor = false, author = null) {
         super(results, hasMore);
         this.type = type;
         this.page = page;
         this.context = context;
-        this.videosOnly = videosOnly;
+        // Support both old signature (videosOnly as boolean) and new (author as 6th param)
+        if (typeof videosOnlyOrAuthor === 'boolean') {
+            this.videosOnly = videosOnlyOrAuthor;
+            this.author = author;
+        } else {
+            this.videosOnly = false;
+            this.author = videosOnlyOrAuthor;
+        }
     }
-    
+
     nextPage() {
         if (this.type === "related_videos") {
             return fetchRelatedVideos(this.context, this.page);
@@ -892,6 +981,8 @@ class RedBullPager extends VideoPager {
             return fetchPlaylists(this.page);
         } else if (this.type === "search") {
             return fetchSearch(this.context.query, this.page);
+        } else if (this.type === "athlete_videos") {
+            return fetchAthleteVideos(this.context, this.page, this.author);
         }
         return fetchFeed(this.type, this.page, this.context, this.videosOnly);
     }
@@ -1000,7 +1091,8 @@ function batchFetchCollections(collectionIds) {
     let batch = http.batch();
     
     for (const collectionId of collectionIdsArray) {
-        const url = `${API_BASE_URL}/feed/en-INT/related-to/${collectionId}?scoring=featured&page[limit]=10&rb3Schema=v1:cardList`;
+        const locale = getLocaleFromId(collectionId);
+        const url = `${API_BASE_URL}/feed/${locale}/related-to/${collectionId}?scoring=featured&page[limit]=10&rb3Schema=v1:cardList`;
         batch = batch.GET(url, HEADERS);
     }
     
@@ -1018,7 +1110,7 @@ function batchFetchCollections(collectionIds) {
                 allEvents.push(...data.data);
             }
         } catch (e) {
-            // Ignore parse errors
+            log("Failed to parse live event collection: " + formatError(e));
         }
     }
     
@@ -1125,8 +1217,8 @@ function fetchPlaylists(page) {
     return new RedBullPlaylistPager(playlists, items.length > 0, page + 1);
 }
 
-function getChannelVideos(url, pager) {
-    
+function getChannelVideos(url, pager, author) {
+
     if (url === "https://www.redbull.com") {
         if (pager && pager instanceof RedBullPager) {
             return pager.nextPage();
@@ -1135,7 +1227,7 @@ function getChannelVideos(url, pager) {
     }
 
     const { type, slug, locale } = parseChannelUrl(url);
-    
+
     if (pager && pager instanceof RedBullPager) {
         return pager.nextPage();
     }
@@ -1144,7 +1236,7 @@ function getChannelVideos(url, pager) {
         return fetchShowVideos(slug);
     } else if (type === "person-profiles") {
         // For athletes, use slug-based filtering to get videos specifically tagged with the athlete
-        return fetchAthleteVideos(slug, 0);
+        return fetchAthleteVideos(slug, 0, author);
     } else if (type === "event-profiles") {
         // For events, use the ID-based related-to API
         const metadata = fetchChannelMetadata(type, slug, locale);
@@ -1211,7 +1303,7 @@ function fetchChannelMetadata(type, slug, locale = "en-INT") {
  * Fetches both metadata and social links for an athlete in a single batched request.
  * This is more efficient than making two separate requests sequentially.
  * 
- * @param {string} slug - The athlete's URL slug (e.g., "brandon-semenuk")
+ * @param {string} slug - The athlete's URL slug
  * @param {string} locale - API locale format (e.g., "en-INT")
  * @returns {Object} Object containing { metadata, socialLinks }
  */
@@ -1245,7 +1337,7 @@ function fetchAthleteChannelData(slug, locale = "en-INT") {
                 };
             }
         } catch (e) {
-            // Ignore parse errors
+            log("Failed to parse athlete metadata: " + formatError(e));
         }
     }
     
@@ -1284,7 +1376,7 @@ function fetchAthleteChannelData(slug, locale = "en-INT") {
                 }
             }
         } catch (e) {
-            // Ignore parse errors
+            log("Failed to parse athlete social links: " + formatError(e));
         }
     }
     
@@ -1330,7 +1422,8 @@ function fetchShowVideos(slug) {
 
 function fetchRelatedVideos(id, page) {
     const offset = page * ITEMS_PER_PAGE;
-    const url = `${API_BASE_URL}/feed/en-INT/related-to/${id}?filter[type]=episode-videos,live-videos,recap-videos,videos&scoring=freshness&page[limit]=${ITEMS_PER_PAGE}&page[offset]=${offset}&rb3Schema=v1:cardList`;
+    const locale = getLocaleFromId(id);
+    const url = `${API_BASE_URL}/feed/${locale}/related-to/${id}?filter[type]=episode-videos,live-videos,recap-videos,videos&scoring=freshness&page[limit]=${ITEMS_PER_PAGE}&page[offset]=${offset}&rb3Schema=v1:cardList`;
     
     const response = httpGET({ url: url });
     if (!response.isOk) {
@@ -1347,59 +1440,210 @@ function fetchRelatedVideos(id, page) {
 }
 
 /**
+ * Creates a PlatformAuthorLink from an athlete API response item.
+ * Extracts athlete metadata and constructs the author link with proper thumbnail.
+ *
+ * @param {Object} athleteItem - Athlete data from API response
+ * @param {string} athleteItem.id - Athlete ID in RRN format
+ * @param {Object} athleteItem.content - Content metadata
+ * @param {string} athleteItem.content.title - Athlete name
+ * @param {Object} athleteItem.reference - Reference data
+ * @param {string} athleteItem.reference.uriSlug - URL slug for athlete page
+ * @returns {PlatformAuthorLink} Author link for the athlete
+ */
+function createAthleteAuthorLink(athleteItem) {
+    const athleteId = athleteItem.id;
+    const athleteName = athleteItem.content?.title || "Unknown";
+    const athleteSlug = athleteItem.reference?.uriSlug;
+    const athleteImageTemplate = extractImage(athleteItem);
+    const athleteUrl = athleteSlug ? `${BASE_URL}/int-en/athlete/${athleteSlug}` : BASE_URL;
+    const athleteThumbnail = athleteImageTemplate
+        ? processImageUrl(athleteImageTemplate, 400, 400)
+        : DEFAULT_THUMBNAIL_URL;
+
+    return new PlatformAuthorLink(
+        new PlatformID(PLATFORM, athleteId, config.id || ""),
+        athleteName,
+        athleteUrl,
+        athleteThumbnail
+    );
+}
+
+/**
+ * Fetches video player data and optionally an athlete in parallel using batched HTTP requests.
+ *
+ * @param {string} contentId - The video content ID in RRN format
+ * @param {string} [athleteUuid] - Optional athlete UUID hint from URL query param.
+ *   Only when provided will the athlete be fetched. Without a hint, athlete is null
+ *   and the caller should use the default "Red Bull TV" author.
+ * @returns {{ playerData: Object|null, athlete: PlatformAuthorLink|null }}
+ *   - playerData: Video player API response with videoUrl, subtitles, etc.
+ *   - athlete: PlatformAuthorLink for the specified athlete, or null if no hint provided
+ *
+ * @example
+ * const { playerData, athlete } = fetchPlayerAndAthlete("rrn:content:episode-videos:...", "772693fd-...");
+ * // athlete is PlatformAuthorLink for the specified athlete UUID
+ * const { playerData, athlete } = fetchPlayerAndAthlete("rrn:content:episode-videos:...");
+ * // athlete is null, use default Red Bull TV author
+ */
+function fetchPlayerAndAthlete(contentId, athleteUuid) {
+    const locale = getLocaleFromId(contentId);
+    const playerUrl = `${PLAYER_API_URL}?videoId=${contentId}`;
+
+    // Only fetch athlete if UUID hint is provided
+    // Without a hint, we don't know which athlete to show, so default to Red Bull TV
+    if (!athleteUuid) {
+        const playerResp = http.GET(playerUrl, {});
+        let playerData = null;
+        if (playerResp.isOk) {
+            try {
+                playerData = JSON.parse(playerResp.body);
+            } catch (e) {
+                log("Failed to parse player data (no athlete hint): " + formatError(e));
+            }
+        }
+        return { playerData, athlete: null };
+    }
+
+    // Fetch player and specific athlete in parallel
+    const athleteUrl = `${API_BASE_URL}/feed/${locale}?filter[id]=rrn:content:person-profiles:${athleteUuid}:${locale}&page[limit]=1&rb3Schema=v1:cardList`;
+
+    const [playerResp, athleteResp] = http.batch()
+        .GET(playerUrl, {})
+        .GET(athleteUrl, HEADERS)
+        .execute();
+
+    // Parse player data
+    let playerData = null;
+    if (playerResp.isOk) {
+        try {
+            playerData = JSON.parse(playerResp.body);
+        } catch (e) {
+            log("Failed to parse player data: " + formatError(e));
+        }
+    }
+
+    // Parse athlete data
+    let athlete = null;
+    if (athleteResp.isOk) {
+        let data = null;
+        try {
+            data = JSON.parse(athleteResp.body);
+        } catch (e) {
+            log("Failed to parse athlete data: " + formatError(e));
+        }
+        const athleteItem = data?.data?.[0];
+        if (athleteItem) {
+            athlete = createAthleteAuthorLink(athleteItem);
+        }
+    }
+
+    return { playerData, athlete };
+}
+
+/**
+ * Fetches a specific athlete by UUID.
+ * Used when athlete UUID hint is provided in the URL query param.
+ *
+ * @param {string} athleteUuid - The athlete's UUID (without locale suffix)
+ * @param {string} locale - API locale format (e.g., "en-INT")
+ * @returns {PlatformAuthorLink|null} PlatformAuthorLink for the athlete, or null if not found
+ */
+function fetchAthleteByUuid(athleteUuid, locale) {
+    const url = `${API_BASE_URL}/feed/${locale}?filter[id]=rrn:content:person-profiles:${athleteUuid}:${locale}&page[limit]=1&rb3Schema=v1:cardList`;
+    const response = httpGET({ url: url });
+
+    if (!response.isOk) return null;
+
+    const athletes = response.body?.data || [];
+    if (athletes.length === 0) return null;
+
+    return createAthleteAuthorLink(athletes[0]);
+}
+
+/**
  * Fetches videos specifically tagged with an athlete using tag-based filtering.
  * This uses two approaches:
  * 1. First tries relationships.tags filter to get videos tagged with the athlete
- *    (used for athletes with many videos like Brandon Semenuk)
  * 2. If that returns empty, falls back to the editorsPick tile endpoint
- *    (used for athletes with curated featured content like Angel Daleman)
- * 
- * @param {string} slug - The athlete's URL slug (e.g., "angel-daleman", "brandon-semenuk")
+ *
+ * On page 0, both requests are batched for better performance.
+ *
+ * @param {string} slug - The athlete's URL slug
  * @param {number} page - Page number for pagination
+ * @param {PlatformAuthorLink|null} [author=null] - Optional author to use for videos.
+ *   When provided, videos will show this author instead of the default "Red Bull TV".
+ *   This is passed from getChannelContents() to display the athlete as the video author.
  * @returns {RedBullPager} Pager containing athlete's videos
  */
-function fetchAthleteVideos(slug, page) {
+function fetchAthleteVideos(slug, page, author) {
     const offset = page * ITEMS_PER_PAGE;
-    
-    // First try: Use tag-based filtering to get videos specifically tagged with this athlete
+
     const tagUrl = `${API_BASE_URL}/feed/en-INT?filter[relationships.tags]=rrn:slug:person-profiles:${slug}&filter[type]=rrn:content:shows,rrn:content:films,rrn:content:episode-videos,rrn:content:videos&scoring=featuredFresh&score.featuredFresh.subType=rail2&page[limit]=${ITEMS_PER_PAGE}&page[offset]=${offset}&rb3Schema=v1:cardList`;
-    
+
+    // On page 0, batch both tag-based and editorsPick requests for better performance
+    if (page === 0) {
+        const tileUrl = `${API_BASE_URL}/feed/en-INT/related-to/rrn:slug:person-profiles:${slug}?scoring=featured&score.featured.subType=editorsPick&score.featured.localeMixing=en-INT&disableUsageRestrictions=true&filter[type]=episode-videos,films,videos,live-videos,recap-videos&page[limit]=${ITEMS_PER_PAGE}&rb3Schema=v1:cardList`;
+
+        const [tagResp, tileResp] = http.batch()
+            .GET(tagUrl, HEADERS)
+            .GET(tileUrl, HEADERS)
+            .execute();
+
+        // Safe JSON parse helper so a bad response does not crash the channel load
+        const safeParse = (resp) => {
+            try {
+                return JSON.parse(resp.body);
+            } catch (e) {
+                log("Failed to parse athlete feed response: " + formatError(e));
+                return null;
+            }
+        };
+
+        // Prefer tag-based results if available
+        if (tagResp.isOk) {
+            const items = safeParse(tagResp)?.data || [];
+            if (items.length > 0) {
+                const videos = items
+                    .map(item => createPlatformVideo(item, author))
+                    .filter(v => v !== null);
+                const hasMore = items.length >= ITEMS_PER_PAGE;
+                return new RedBullPager(videos, hasMore, "athlete_videos", page + 1, slug, author);
+            }
+        }
+
+        // Fall back to editorsPick results
+        if (tileResp.isOk) {
+            const items = safeParse(tileResp)?.data || [];
+            const videos = items
+                .map(item => createPlatformVideo(item, author))
+                .filter(v => v !== null);
+            // editorsPick typically returns just a few items, so no pagination
+            return new RedBullPager(videos, false, "athlete_videos", page + 1, slug, author);
+        }
+        return new RedBullPager([], false, "athlete_videos", page, slug, author);
+    }
+
+    // For subsequent pages, only tag-based filtering supports pagination
     const tagResponse = httpGET({ url: tagUrl });
     if (tagResponse.isOk) {
         const items = tagResponse.body?.data || [];
         if (items.length > 0) {
             const videos = items
-                .map(item => createPlatformVideo(item))
+                .map(item => createPlatformVideo(item, author))
                 .filter(v => v !== null);
-            
             const hasMore = items.length >= ITEMS_PER_PAGE;
-            return new RedBullPager(videos, hasMore, "athlete_videos", page + 1, slug);
+            return new RedBullPager(videos, hasMore, "athlete_videos", page + 1, slug, author);
         }
     }
-    
-    // Fallback: Use the editorsPick tile endpoint for athletes with curated featured content
-    // This endpoint returns videos that are specifically featured for this athlete
-    if (page === 0) {
-        const tileUrl = `${API_BASE_URL}/feed/en-INT/related-to/rrn:slug:person-profiles:${slug}?scoring=featured&score.featured.subType=editorsPick&score.featured.localeMixing=en-INT&disableUsageRestrictions=true&filter[type]=episode-videos,films,videos,live-videos,recap-videos&page[limit]=${ITEMS_PER_PAGE}&rb3Schema=v1:cardList`;
-        
-        const tileResponse = httpGET({ url: tileUrl });
-        if (tileResponse.isOk) {
-            const items = tileResponse.body?.data || [];
-            const videos = items
-                .map(item => createPlatformVideo(item))
-                .filter(v => v !== null);
-            
-            // editorsPick typically returns just a few items, so no pagination
-            return new RedBullPager(videos, false, "athlete_videos", page + 1, slug);
-        }
-    }
-    
-    return new RedBullPager([], false, "athlete_videos", page, slug);
+
+    return new RedBullPager([], false, "athlete_videos", page, slug, author);
 }
 
 function fetchRelatedPlaylists(id, page) {
     const offset = page * ITEMS_PER_PAGE;
-    const url = `${API_BASE_URL}/feed/en-INT/related-to/${id}?filter[type]=shows&scoring=freshness&page[limit]=${ITEMS_PER_PAGE}&page[offset]=${offset}&rb3Schema=v1:cardList`;
+    const locale = getLocaleFromId(id);
+    const url = `${API_BASE_URL}/feed/${locale}/related-to/${id}?filter[type]=shows&scoring=freshness&page[limit]=${ITEMS_PER_PAGE}&page[offset]=${offset}&rb3Schema=v1:cardList`;
     
     const response = httpGET({ url: url });
     if (!response.isOk) {
@@ -1434,6 +1678,7 @@ function getShowPlaylistDetails(slug) {
     try {
         metadataData = JSON.parse(metadataResp.body);
     } catch (e) {
+        log("Failed to parse show metadata: " + formatError(e));
         throw new ScriptException("Failed to parse show metadata");
     }
     
@@ -1455,7 +1700,7 @@ function getShowPlaylistDetails(slug) {
     return new PlatformPlaylistDetails({
         id: new PlatformID(PLATFORM, data.id, config.id || ""),
         name: title,
-        author: new PlatformAuthorLink(new PlatformID(PLATFORM, "RedBull", config.id || ""), "Red Bull TV", BASE_URL, "https://www.redbull.com/favicon.ico"),
+        author: defaultAuthor(),
         url: `${BASE_URL}/int-en/shows/${slug}`,
         thumbnail: image,
         videoCount: videoCount,
@@ -1492,6 +1737,7 @@ function extractShowVideos(videosResp) {
             }
         }
     } catch (e) {
+        log("Failed to parse show videos: " + formatError(e));
         // Ignore parse errors, return empty array
     }
     
@@ -1514,7 +1760,8 @@ function getCollectionPlaylistDetails(slug) {
     const image = processImageUrl(imageBase, 640, 360);
     
     // Fetch videos related to this collection
-    const videosUrl = `${API_BASE_URL}/feed/en-INT/related-to/${collectionId}?filter[type]=episode-videos,videos,films,live-videos&scoring=freshness&page[limit]=50&rb3Schema=v1:cardList`;
+    const locale = getLocaleFromId(collectionId);
+    const videosUrl = `${API_BASE_URL}/feed/${locale}/related-to/${collectionId}?filter[type]=episode-videos,videos,films,live-videos&scoring=freshness&page[limit]=50&rb3Schema=v1:cardList`;
     const videosResp = httpGET({ url: videosUrl });
     
     let videos = [];
@@ -1528,7 +1775,7 @@ function getCollectionPlaylistDetails(slug) {
     return new PlatformPlaylistDetails({
         id: new PlatformID(PLATFORM, collectionId, config.id || ""),
         name: title,
-        author: new PlatformAuthorLink(new PlatformID(PLATFORM, "RedBull", config.id || ""), "Red Bull TV", BASE_URL, "https://www.redbull.com/favicon.ico"),
+        author: defaultAuthor(),
         url: `${BASE_URL}/int-en/discover/${slug}`,
         thumbnail: image,
         videoCount: videos.length,
@@ -1576,6 +1823,7 @@ function httpGET(options) {
                 headers: response.headers
             };
         } catch (e) {
+            log("httpGET parse failed: " + formatError(e));
             // Ignore JSON parse error, return original response
         }
     }
@@ -1638,7 +1886,7 @@ function extractImage(item) {
  * If url is null/empty, returns Red Bull favicon as fallback.
  */
 function processImageUrl(url, width, height) {
-    if (!url) return "https://www.redbull.com/favicon.ico";
+    if (!url) return DEFAULT_THUMBNAIL_URL;
     return url.replace("{op}", `c_fill,w_${width},h_${height},g_auto,q_auto,f_auto`);
 }
 
@@ -1765,8 +2013,11 @@ function constructVideoUrl(item) {
  * @param {Object} [item.content] - Content metadata
  * @param {string} [item.content.title] - Content title
  * @param {Object} [item.badge] - Live/upcoming badge for events
+ * @param {PlatformAuthorLink|null} [authorOverride=null] - Optional author to use instead of default "Red Bull TV".
+ *   When provided, this author will be used for the video. This is used when fetching channel contents
+ *   to display the channel owner (e.g., an athlete) as the video author instead of the generic platform author.
  * @returns {PlatformVideo|null} PlatformVideo object, or null if content should be filtered
- * 
+ *
  * Filtering logic:
  *   1. Returns null if no ID found
  *   2. Returns null for show/collection types (handled as playlists)
@@ -1777,17 +2028,22 @@ function constructVideoUrl(item) {
  *      - audio-series (series containers, not episodes)
  *      - collections (collection containers)
  *   5. Filters out NON_VIDEO_ENTITY_TYPES: athlete, team, story
- * 
+ *
  * Live status detection:
  *   - Events with live badge → isLive=true, uses badge.reference for stream
  *   - Events with upcoming badge → isLive=true (scheduled)
  *   - Content with 'live-videos' in ID + status='live' → isLive=true
- * 
+ *
  * @example
+ * // Basic usage - uses default "Red Bull TV" author
  * const video = createPlatformVideo(apiItem);
- * // Returns: PlatformVideo with video metadata, or null if filtered
+ *
+ * @example
+ * // With author override - used for athlete channel contents
+ * const athleteAuthor = new PlatformAuthorLink(channelId, "Athlete Name", channelUrl, thumbnail);
+ * const video = createPlatformVideo(apiItem, athleteAuthor);
  */
-function createPlatformVideo(item) {
+function createPlatformVideo(item, authorOverride = null) {
     let id = item.id || item.reference?.id;
     let title = item.content?.title || item.title || "Unknown Title";
     let imageBase = extractImage(item);
@@ -1849,17 +2105,43 @@ function createPlatformVideo(item) {
     }
 
     const thumbnails = createThumbnails(imageBase);
-    
+
     // Build video URL with correct locale
-    const videoUrl = buildVideoUrl(item, uriSlug, type, id);
+    let videoUrl = buildVideoUrl(item, uriSlug, type, id);
+
+    // If we have an author override (e.g., from athlete channel), add athlete UUID hint to URL
+    // This allows getContentDetails to fetch the correct athlete when multiple are related to the video
+    if (authorOverride?.id?.value) {
+        const athleteUuid = extractMasterIdFromId(authorOverride.id.value);
+        if (athleteUuid) {
+            try {
+                const u = new URL(videoUrl);
+                // Avoid duplicate query entries
+                if (!u.searchParams.has('athlete')) {
+                    u.searchParams.append('athlete', athleteUuid);
+                }
+                videoUrl = u.toString();
+            } catch (e) {
+                log("Failed to append athlete query param: " + formatError(e));
+                // Fallback for any unexpected URL parse issues
+                const separator = videoUrl.includes('?') ? '&' : '?';
+                if (!videoUrl.includes('athlete=')) {
+                    videoUrl += `${separator}athlete=${athleteUuid}`;
+                }
+            }
+        }
+    }
 
     const publishedDate = extractPublishedDate(item);
+
+    // Use provided author override (e.g., athlete for channel contents) or default to Red Bull TV
+    const author = authorOverride || defaultAuthor();
 
     return new PlatformVideo({
         id: new PlatformID(PLATFORM, id, config.id || ""),
         name: title,
         thumbnails: thumbnails,
-        author: new PlatformAuthorLink(new PlatformID(PLATFORM, "RedBull", config.id || ""), "Red Bull TV", BASE_URL, "https://www.redbull.com/favicon.ico"),
+        author: author,
         uploadDate: publishedDate,
         duration: duration,
         viewCount: 0,
@@ -1914,7 +2196,7 @@ function createPlatformAudio(item, id, title, imageBase, uriSlug, type) {
         id: new PlatformID(PLATFORM, id, config.id || ""),
         name: title,
         thumbnails: thumbnails,
-        author: new PlatformAuthorLink(new PlatformID(PLATFORM, "RedBull", config.id || ""), "Red Bull Podcasts", BASE_URL, "https://www.redbull.com/favicon.ico"),
+        author: defaultAuthor("Red Bull Podcasts"),
         uploadDate: publishedDate,
         duration: duration,
         viewCount: 0,
@@ -1977,7 +2259,7 @@ function createPlatformPlaylist(item) {
     return new PlatformPlaylist({
         id: new PlatformID(PLATFORM, id, config.id || ""),
         name: title,
-        author: new PlatformAuthorLink(new PlatformID(PLATFORM, "RedBull", config.id || ""), "Red Bull TV", BASE_URL, "https://www.redbull.com/favicon.ico"),
+        author: defaultAuthor(),
         thumbnail: highResThumbUrl,
         url: playlistUrl,
         videoCount: videoCount
@@ -2205,6 +2487,20 @@ function createPlatformChannel(item) {
         url: url,
         links: {}
     });
+}
+
+/**
+ * Formats an error for logging with type and message.
+ * Handles non-Error objects gracefully.
+ *
+ * @param {*} e - The error to format
+ * @returns {string} Formatted error string
+ */
+function formatError(e) {
+    if (e instanceof Error) {
+        return e.name + ": " + e.message;
+    }
+    return String(e);
 }
 
 log("loaded");
