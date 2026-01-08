@@ -119,6 +119,14 @@ const SHOW_EPISODE_REGEX = /\/([a-z]{2,3}-[a-z]{2,3})\/episodes\/([^\/\?]+)/i;
 const VIDEO_URL_REGEX = /\/([a-z]{2,3}-[a-z]{2,3})\/videos\/([^\/\?]+)/i;
 
 /**
+ * Matches film detail URLs and extracts locale and slug.
+ * Captures:
+ *   Group 1: Locale e.g., 'int-en', 'de-de'
+ *   Group 2: Film slug e.g., 'where-the-trail-ends'
+ */
+const FILM_URL_REGEX = /\/([a-z]{2,3}-[a-z]{2,3})\/films\/([^\/\?]+)/i;
+
+/**
  * Parses channel URLs to extract locale, type, and slug.
  * Captures:
  *   Group 1: Locale prefix e.g., 'int-en'
@@ -489,7 +497,13 @@ source.getContentDetails = function(url) {
     if (videosMatch) {
         return getVideoTypeContentDetails(url, videosMatch[1], videosMatch[2], 'videos', athleteUuid);
     }
-    
+
+    const filmsMatch = path.match(FILM_URL_REGEX);
+    if (filmsMatch) {
+        return getVideoTypeContentDetails(url, filmsMatch[1], filmsMatch[2], 'films', athleteUuid);
+    }
+
+    // Fallback: fetch page config for other content types (live events, etc.)
     const configUrl = `${BASE_URL}/v3/config/pages?url=${path}`;
     const configResp = httpGET({ url: configUrl });
     
@@ -557,13 +571,49 @@ source.getContentDetails = function(url) {
         return getAudioContentDetails(url, contentId, title, description, thumbnails, duration, publishedDate);
     }
 
-    // Video content - fetch from video player API
+    // Video content - fetch player data (and optionally athlete) from APIs
     const playerUrl = `${PLAYER_API_URL}?videoId=${contentId}`;
-    const playerResp = httpGET({ url: playerUrl });
-    if (!playerResp.isOk) throw new ScriptException("Failed to fetch video sources");
-    
-    let playerData = playerResp.body;
-    
+    const locale = getLocaleFromId(contentId);
+
+    let playerData = null;
+    let author = defaultAuthor();
+
+    // Batch player + athlete fetch when athlete hint is provided
+    if (athleteUuid) {
+        const athleteUrl = `${API_BASE_URL}/feed/${locale}?filter[id]=rrn:content:person-profiles:${athleteUuid}:${locale}&page[limit]=1&rb3Schema=v1:cardList`;
+
+        const [playerResp, athleteResp] = http.batch()
+            .GET(playerUrl, {})
+            .GET(athleteUrl, HEADERS)
+            .execute();
+
+        if (!playerResp.isOk) throw new ScriptException("Failed to fetch video sources");
+
+        try {
+            playerData = JSON.parse(playerResp.body);
+        } catch (e) {
+            throw new ScriptException("Failed to parse video sources");
+        }
+
+        // Parse athlete data
+        if (athleteResp.isOk) {
+            let athleteData = null;
+            try {
+                athleteData = JSON.parse(athleteResp.body);
+            } catch (e) {
+                log("Failed to parse athlete data: " + formatError(e));
+            }
+            const athleteItem = athleteData?.data?.[0];
+            if (athleteItem) {
+                author = createAthleteAuthorLink(athleteItem);
+            }
+        }
+    } else {
+        const playerResp = httpGET({ url: playerUrl });
+        if (!playerResp.isOk) throw new ScriptException("Failed to fetch video sources");
+        playerData = playerResp.body;
+    }
+
     // If the player API redirects us to a different video ID (e.g. event -> live video), follow it
     if (!playerData.videoUrl && playerData.videoId && playerData.videoId !== contentId) {
         const retryUrl = `${PLAYER_API_URL}?videoId=${playerData.videoId}`;
@@ -587,12 +637,6 @@ source.getContentDetails = function(url) {
     }
 
     const subtitles = extractSubtitles(playerData);
-
-    // Only fetch athlete if UUID hint is provided (consistent with videos/episodes flow)
-    const authorFallback = defaultAuthor();
-    const author = athleteUuid
-        ? (fetchAthleteByUuid(athleteUuid, getLocaleFromId(contentId)) || authorFallback)
-        : authorFallback;
 
     const result = new PlatformVideoDetails({
         id: new PlatformID(PLATFORM, contentId, config.id || ""),
