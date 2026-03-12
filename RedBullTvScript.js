@@ -48,6 +48,7 @@ const NON_VIDEO_ENTITY_TYPES = ['athlete', 'team', 'story'];
 
 // Pagination
 const ITEMS_PER_PAGE = 20;
+const CHANNELS_PER_PAGE = 100;
 const PREFERRED_LOCALE = 'en-INT';
 
 // ============================================================================
@@ -399,50 +400,16 @@ source.search = function (query, type, order, filters) {
 
 source.searchChannels = function (query) {
     const encodedQuery = encodeURIComponent(query);
-    const url = `${API_BASE_URL}/feed/en-INT?rb3SearchString=${encodedQuery}&rb3SearchTab=athletes&rb3Schema=v1:searchResults&page[limit]=20`;
-    
+    const url = `${API_BASE_URL}/feed/en-INT?rb3SearchString=${encodedQuery}&rb3SearchTab=athletes&rb3Schema=v1:searchResults&page[limit]=${CHANNELS_PER_PAGE}`;
+
     const response = httpGET({ url: url });
-    if (!response.isOk) return new RedBullChannelPager([], false, query, 0);
-    
+    if (!response.isOk) return new ChannelPager([], false);
+
     const items = response.body?.data?.results || [];
-    
-    // Deduplicate athletes by masterId (UUID) - same athlete appears multiple times for different locales
-    // Prefer en-INT locale
-    const seenMasterIds = new Map();
-    const deduplicatedItems = [];
-    
-    for (const item of items) {
-        const id = item.id || '';
-        const masterId = extractMasterIdFromId(id);
-        
-        if (!masterId) {
-            deduplicatedItems.push(item);
-            continue;
-        }
-        
-        const existingItem = seenMasterIds.get(masterId);
-        if (!existingItem) {
-            seenMasterIds.set(masterId, item);
-            deduplicatedItems.push(item);
-            continue;
-        }
-        
-        // Prefer en-INT locale over others
-        const existingLocale = getLocaleFromItem(existingItem);
-        const newLocale = getLocaleFromItem(item);
-        
-        if (newLocale === 'en-INT' && existingLocale !== 'en-INT') {
-            const itemIndex = deduplicatedItems.indexOf(existingItem);
-            if (itemIndex !== -1) {
-                deduplicatedItems[itemIndex] = item;
-                seenMasterIds.set(masterId, item);
-            }
-        }
-    }
-    
-    const channels = deduplicatedItems.map(item => createPlatformChannel(item)).filter(c => c !== null);
-    
-    return new RedBullChannelPager(channels, items.length >= 20, query, 1);
+    const channels = deduplicateChannelItems(items);
+
+    // The athlete search API ignores page[offset], so all results come in one request
+    return new ChannelPager(channels, false);
 };
 
 /**
@@ -1059,27 +1026,6 @@ class RedBullPlaylistPager extends PlaylistPager {
     }
 }
 
-class RedBullChannelPager extends ChannelPager {
-    constructor(results, hasMore, query, page) {
-        super(results, hasMore);
-        this.query = query;
-        this.page = page;
-    }
-    
-    nextPage() {
-        const encodedQuery = encodeURIComponent(this.query);
-        const offset = this.page * 20;
-        const url = `${API_BASE_URL}/feed/en-INT?rb3SearchString=${encodedQuery}&rb3SearchTab=athletes&rb3Schema=v1:searchResults&page[limit]=20&page[offset]=${offset}`;
-        
-        const response = httpGET({ url: url });
-        if (!response.isOk) return new RedBullChannelPager([], false, this.query, this.page);
-        
-        const items = response.body?.data?.results || [];
-        const channels = items.map(item => createPlatformChannel(item)).filter(c => c !== null);
-        
-        return new RedBullChannelPager(channels, items.length >= 20, this.query, this.page + 1);
-    }
-}
 
 function fetchLiveEvents() {
     const configUrl = `${BASE_URL}/v3/config/pages?url=/int-en/live-events`;
@@ -1198,7 +1144,7 @@ function fetchFeed(type, page, context = null, videosOnly = false) {
     const deduplicatedContent = deduplicateById(content);
     const sortedContent = sortLiveVideosFirst(deduplicatedContent);
     
-    return new RedBullPager(sortedContent, items.length > 0, type, page + 1, context, videosOnly);
+    return new RedBullPager(sortedContent, items.length >= ITEMS_PER_PAGE, type, page + 1, context, videosOnly);
 }
 
 /**
@@ -1267,7 +1213,7 @@ function fetchPlaylists(page) {
         .map(item => createPlatformPlaylist(item))
         .filter(p => p !== null);
     
-    return new RedBullPlaylistPager(playlists, items.length > 0, page + 1);
+    return new RedBullPlaylistPager(playlists, items.length >= ITEMS_PER_PAGE, page + 1);
 }
 
 function getChannelVideos(url, pager, author) {
@@ -1843,11 +1789,8 @@ function getCollectionPlaylistDetails(slug) {
  * @param {boolean} [options.useAuthenticated=false] - Whether to use authenticated request (reserved for future use)
  * @param {boolean} [options.parseResponse=true] - Whether to parse JSON response
  * @param {Object} [options.headers=null] - Custom headers (defaults to HEADERS constant)
- * @returns {HTTPResponse} Response object with parsed body if JSON, otherwise raw response
- * @returns {number} return.code - HTTP status code
- * @returns {boolean} return.isOk - True if request succeeded
- * @returns {Object|string} return.body - Parsed JSON object if parseResponse=true, otherwise raw string
- * @returns {Object} return.headers - Response headers
+ * @returns {{code: number, isOk: boolean, body: Object|string, headers: Object}}
+ *   Response with parsed JSON body when parseResponse=true, otherwise raw response
  */
 function httpGET(options) {
     const {
@@ -2013,52 +1956,51 @@ function createThumbnails(imageUrl) {
 
 
 /**
- * Constructs the full Red Bull website URL for a content item.
- * Uses the uriSlug and type to determine the appropriate URL path.
- * 
+ * Builds a video URL from item data.
+ *
+ * When explicit params (uriSlug, type, id) are provided, uses the item's
+ * actual locale. When only item is provided, extracts slug/type from
+ * item.reference and defaults to 'int-en' locale.
+ *
  * @param {Object} item - Content item from API response
- * @param {Object} [item.reference] - Reference container for slug and type
- * @param {string} [item.reference.uriSlug] - URL-friendly slug (e.g., 'extreme-skiing-alps')
- * @param {string} [item.type] - Content type
- * @param {string} [item.reference.type] - Alternative type location
- * @returns {string} Full URL to content page
- * 
+ * @param {string} [uriSlug] - URL slug (if omitted, uses item.reference.uriSlug)
+ * @param {string} [type] - Content type (if omitted, uses item.type or item.reference.type)
+ * @param {string} [id] - Content ID (RRN string)
+ * @returns {string} Full video URL
+ *
  * URL patterns by type:
- *   - episode → /int-en/episodes/{slug}
- *   - film → /int-en/films/{slug}
- *   - show → /int-en/shows/{slug}
- *   - event → /int-en/events/{slug}
- *   - live-videos, videoLive → /int-en/live/{slug}
- *   - default (videos) → /int-en/videos/{slug}
- * 
- * Note: Always uses 'int-en' locale for consistency, even if item has different locale.
- * 
+ *   - episode / episode-videos → /{locale}/episodes/{slug}
+ *   - film → /{locale}/films/{slug}
+ *   - show → /{locale}/shows/{slug}
+ *   - event → /{locale}/events/{slug}
+ *   - live-videos, videoLive → /{locale}/live/{slug}
+ *   - default (videos) → /{locale}/videos/{slug}
+ *
  * @example
- * constructVideoUrl({ reference: { uriSlug: 'rampage', type: 'film' } })
+ * buildVideoUrl(item, 'rampage', 'film', 'rrn:content:films:abc:en-INT')
+ * // Returns: 'https://www.redbull.com/int-en/films/rampage'
+ *
+ * buildVideoUrl({ reference: { uriSlug: 'rampage', type: 'film' } })
  * // Returns: 'https://www.redbull.com/int-en/films/rampage'
  */
-/**
- * Helper function to build a video URL from item data.
- * Handles locale conversion and URL path determination.
- * 
- * @param {Object} item - Content item
- * @param {string} uriSlug - URL slug
- * @param {string} type - Content type
- * @param {string} id - Content ID
- * @returns {string} Full video URL
- */
 function buildVideoUrl(item, uriSlug, type, id) {
+    let useDefaultLocale = false;
+
     if (!uriSlug) {
-        return constructVideoUrl(item);
+        uriSlug = item.reference?.uriSlug;
+        if (!uriSlug) return BASE_URL;
+        type = item.type || item.reference?.type;
+        useDefaultLocale = true;
     }
-    
-    const locale = getLocaleFromItem(item);
-    const urlPrefix = convertApiLocaleToUrlLocale(locale);
-    
+
+    const urlPrefix = useDefaultLocale
+        ? 'int-en'
+        : convertApiLocaleToUrlLocale(getLocaleFromItem(item));
+
     // Determine URL path based on content type
     let pathSegment = 'videos'; // default
     
-    if (type === 'episode' || id.includes('episode-videos')) {
+    if (type === 'episode' || (id && id.includes('episode-videos'))) {
         pathSegment = 'episodes';
     } else if (type === 'film') {
         pathSegment = 'films';
@@ -2069,31 +2011,8 @@ function buildVideoUrl(item, uriSlug, type, id) {
     } else if (type === 'live-videos' || type === 'videoLive') {
         pathSegment = 'live';
     }
-    
-    return `${BASE_URL}/${urlPrefix}/${pathSegment}/${uriSlug}`;
-}
 
-function constructVideoUrl(item) {
-    const uriSlug = item.reference?.uriSlug;
-    if (!uriSlug) {
-        return `${BASE_URL}`;
-    }
-    
-    const type = item.type || item.reference?.type;
-    
-    if (type === 'episode') {
-        return `${BASE_URL}/int-en/episodes/${uriSlug}`;
-    } else if (type === 'film') {
-        return `${BASE_URL}/int-en/films/${uriSlug}`;
-    } else if (type === 'show') {
-        return `${BASE_URL}/int-en/shows/${uriSlug}`;
-    } else if (type === 'event') {
-         return `${BASE_URL}/int-en/events/${uriSlug}`;
-    } else if (type === 'live-videos' || type === 'videoLive') {
-         return `${BASE_URL}/int-en/live/${uriSlug}`;
-    } else {
-        return `${BASE_URL}/int-en/videos/${uriSlug}`;
-    }
+    return `${BASE_URL}/${urlPrefix}/${pathSegment}/${uriSlug}`;
 }
 
 /**
@@ -2153,6 +2072,8 @@ function createPlatformVideo(item, authorOverride = null) {
         title = `${title} (${locale})`;
     }
     
+    if (!id) return null;
+
     // Handle Live Events
     if (item.type === 'event' && item.badge?.type === 'live' && item.badge?.reference) {
         const ref = item.badge.reference;
@@ -2161,13 +2082,11 @@ function createPlatformVideo(item, authorOverride = null) {
         type = 'live-videos';
         isLive = true;
     } else if (item.type === 'event' && item.badge?.type === 'upcoming') {
-        isLive = true; 
+        isLive = true;
     } else {
-        isLive = (id.includes("live-videos") || item.type === 'live-videos') && 
+        isLive = (id.includes("live-videos") || item.type === 'live-videos') &&
                    (item.content?.status === 'live' || item.liveBroadcast?.status === 'live');
     }
-
-    if (!id) return null;
 
     // Check for playlist types
     if (item.type === 'show' || item.type === 'shows' || id.includes('content:shows')) {
@@ -2465,18 +2384,34 @@ function extractMasterIdFromId(id) {
 /**
  * Extracts locale from a content item, with fallback logic.
  * Tries multiple sources in order:
- *   1. item.id (content ID)
- *   2. item.reference.id (referenced content ID)
- *   3. 'en-INT' (default fallback)
- * 
+ *   1. item.reference.locale
+ *   2. item.locale
+ *   3. Locale from item.reference.id (RRN format)
+ *   4. Locale from item.id (RRN format)
+ *   5. 'en-INT' (default fallback)
+ *
  * @param {Object} item - Content item from API response
- * @param {string} [item.id] - Direct content ID
- * @param {Object} [item.reference] - Reference to another content item
- * @param {string} [item.reference.id] - Referenced content ID
  * @returns {string} Locale code (e.g., 'en-INT', 'el-GR')
  */
 function getLocaleFromItem(item) {
-    return item.reference?.locale || item.locale || "en-INT";
+    return item.reference?.locale
+        || item.locale
+        || extractLocaleFromId(item.reference?.id)
+        || extractLocaleFromId(item.id)
+        || "en-INT";
+}
+
+/**
+ * Extracts the locale from an RRN ID, returning null if not found.
+ * Unlike getLocaleFromId(), does not fall back to a default.
+ *
+ * @param {string} id - Full content ID in RRN format
+ * @returns {string|null} Locale code or null
+ */
+function extractLocaleFromId(id) {
+    if (!id) return null;
+    const parts = id.split(':');
+    return parts.length >= 5 ? parts[4] : null;
 }
 
 /**
@@ -2486,12 +2421,12 @@ function getLocaleFromItem(item) {
  * This function extracts the final LOCALE component.
  * 
  * @param {string} id - Full content ID in RRN format
- * @returns {string|null} Locale code (e.g., 'en-INT', 'el-GR'), or null if not found
- * 
+ * @returns {string} Locale code (e.g., 'en-INT', 'el-GR'), defaults to 'en-INT'
+ *
  * @example
  * getLocaleFromId('rrn:content:videos:abc123:en-INT') // Returns: 'en-INT'
  * getLocaleFromId('rrn:content:episode-videos:xyz789:el-GR') // Returns: 'el-GR'
- * getLocaleFromId('invalid-id') // Returns: null
+ * getLocaleFromId('invalid-id') // Returns: 'en-INT'
  */
 function getLocaleFromId(id) {
     if (!id) return "en-INT";
@@ -2583,6 +2518,50 @@ function createPlatformChannel(item) {
         url: url,
         links: {}
     });
+}
+
+/**
+ * Deduplicates channel search results by master ID (UUID).
+ * The same athlete appears multiple times for different locales; this keeps
+ * only one entry per athlete, preferring the en-INT locale variant.
+ *
+ * @param {Array} items - Raw search result items from the API
+ * @returns {Array<PlatformChannel>} Deduplicated channel objects
+ */
+function deduplicateChannelItems(items) {
+    const seenMasterIds = new Map();
+    const deduplicatedItems = [];
+
+    for (const item of items) {
+        const id = item.id || '';
+        const masterId = extractMasterIdFromId(id);
+
+        if (!masterId) {
+            deduplicatedItems.push(item);
+            continue;
+        }
+
+        const existingItem = seenMasterIds.get(masterId);
+        if (!existingItem) {
+            seenMasterIds.set(masterId, item);
+            deduplicatedItems.push(item);
+            continue;
+        }
+
+        // Prefer en-INT locale over others
+        const existingLocale = getLocaleFromItem(existingItem);
+        const newLocale = getLocaleFromItem(item);
+
+        if (newLocale === 'en-INT' && existingLocale !== 'en-INT') {
+            const itemIndex = deduplicatedItems.indexOf(existingItem);
+            if (itemIndex !== -1) {
+                deduplicatedItems[itemIndex] = item;
+                seenMasterIds.set(masterId, item);
+            }
+        }
+    }
+
+    return deduplicatedItems.map(item => createPlatformChannel(item)).filter(c => c !== null);
 }
 
 /**
