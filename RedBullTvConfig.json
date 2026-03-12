@@ -5,7 +5,7 @@
   "author": "FUTO",
   "authorUrl": "https://futo.org",
   "platformUrl": "https://www.redbull.com/int-en/discover",
-  "version": 4,
+  "version": 5,
   "iconUrl": "./RedBullTvIcon.png",
   "scriptUrl": "./RedBullTvScript.js",
   "repositoryUrl": "https://gitlab.futo.org/videostreaming/plugins/redbull-tv",
@@ -15,7 +15,15 @@
   "packages": [
     "Http"
   ],
+  "packagesOptional": [
+    "HttpImp"
+  ],
   "allowUrls": [
     ".redbull.com"
-  ]
+  ],
+  "changelog": {
+    "5": [
+      "Improvement: Use browser impersonation;"
+    ]
+  }
 }

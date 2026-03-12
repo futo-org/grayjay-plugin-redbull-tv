@@ -15,6 +15,18 @@ const HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9'
 };
 
+// Browser TLS impersonation support (optional package)
+const IS_IMPERSONATION_AVAILABLE = (typeof httpimp !== 'undefined');
+const IS_DESKTOP = bridge.buildPlatform === "desktop";
+const IMPERSONATION_TARGET = IS_DESKTOP ? 'chrome136' : 'chrome131_android';
+
+if (IS_IMPERSONATION_AVAILABLE) {
+    const httpImpClient = httpimp.getDefaultClient(true);
+    if (httpImpClient.setDefaultImpersonateTarget) {
+        httpImpClient.setDefaultImpersonateTarget(IMPERSONATION_TARGET);
+    }
+}
+
 /**
  * Content types that cannot be played directly through the player APIs.
  * These are typically profile pages, articles, or container types.
@@ -582,10 +594,10 @@ source.getContentDetails = function(url) {
     if (athleteUuid) {
         const athleteUrl = `${API_BASE_URL}/feed/${locale}?filter[id]=rrn:content:person-profiles:${athleteUuid}:${locale}&page[limit]=1&rb3Schema=v1:cardList`;
 
-        const [playerResp, athleteResp] = http.batch()
-            .GET(playerUrl, {})
-            .GET(athleteUrl, HEADERS)
-            .execute();
+        const [playerResp, athleteResp] = batchGET([
+            { url: playerUrl, headers: {} },
+            { url: athleteUrl }
+        ]);
 
         if (!playerResp.isOk) throw new ScriptException("Failed to fetch video sources");
 
@@ -1132,15 +1144,12 @@ function extractLiveEventCollectionIds(panels) {
  */
 function batchFetchCollections(collectionIds) {
     const collectionIdsArray = Array.from(collectionIds);
-    let batch = http.batch();
-    
-    for (const collectionId of collectionIdsArray) {
+    const requests = collectionIdsArray.map(collectionId => {
         const locale = getLocaleFromId(collectionId);
-        const url = `${API_BASE_URL}/feed/${locale}/related-to/${collectionId}?scoring=featured&page[limit]=10&rb3Schema=v1:cardList`;
-        batch = batch.GET(url, HEADERS);
-    }
-    
-    const responses = batch.execute();
+        return { url: `${API_BASE_URL}/feed/${locale}/related-to/${collectionId}?scoring=featured&page[limit]=10&rb3Schema=v1:cardList` };
+    });
+
+    const responses = batchGET(requests);
     const allEvents = [];
     
     for (const resp of responses) {
@@ -1355,11 +1364,11 @@ function fetchAthleteChannelData(slug, locale = "en-INT") {
     const metadataUrl = `${API_BASE_URL}/feed/${locale}?filter[type]=person-profiles&filter[uriSlug]=${slug}&page[limit]=1&rb3Schema=v1:cardList`;
     const socialLinksUrl = `${API_BASE_URL}/feed/${locale}?filter[type]=person-profiles&filter[uriSlug]=${slug}&page[limit]=1&disableUsageRestrictions=true&rb3Schema=v2:personHero`;
     
-    const [metadataResp, socialLinksResp] = http.batch()
-        .GET(metadataUrl, HEADERS)
-        .GET(socialLinksUrl, HEADERS)
-        .execute();
-    
+    const [metadataResp, socialLinksResp] = batchGET([
+        { url: metadataUrl },
+        { url: socialLinksUrl }
+    ]);
+
     // Parse metadata
     let metadata = null;
     if (metadataResp.isOk) {
@@ -1537,14 +1546,10 @@ function fetchPlayerAndAthlete(contentId, athleteUuid) {
     // Only fetch athlete if UUID hint is provided
     // Without a hint, we don't know which athlete to show, so default to Red Bull TV
     if (!athleteUuid) {
-        const playerResp = http.GET(playerUrl, {});
+        const playerResp = httpGET({ url: playerUrl, headers: {} });
         let playerData = null;
         if (playerResp.isOk) {
-            try {
-                playerData = JSON.parse(playerResp.body);
-            } catch (e) {
-                log("Failed to parse player data (no athlete hint): " + formatError(e));
-            }
+            playerData = playerResp.body;
         }
         return { playerData, athlete: null };
     }
@@ -1552,10 +1557,10 @@ function fetchPlayerAndAthlete(contentId, athleteUuid) {
     // Fetch player and specific athlete in parallel
     const athleteUrl = `${API_BASE_URL}/feed/${locale}?filter[id]=rrn:content:person-profiles:${athleteUuid}:${locale}&page[limit]=1&rb3Schema=v1:cardList`;
 
-    const [playerResp, athleteResp] = http.batch()
-        .GET(playerUrl, {})
-        .GET(athleteUrl, HEADERS)
-        .execute();
+    const [playerResp, athleteResp] = batchGET([
+        { url: playerUrl, headers: {} },
+        { url: athleteUrl }
+    ]);
 
     // Parse player data
     let playerData = null;
@@ -1629,10 +1634,10 @@ function fetchAthleteVideos(slug, page, author) {
     if (page === 0) {
         const tileUrl = `${API_BASE_URL}/feed/en-INT/related-to/rrn:slug:person-profiles:${slug}?scoring=featured&score.featured.subType=editorsPick&score.featured.localeMixing=en-INT&disableUsageRestrictions=true&filter[type]=episode-videos,films,videos,live-videos,recap-videos&page[limit]=${ITEMS_PER_PAGE}&rb3Schema=v1:cardList`;
 
-        const [tagResp, tileResp] = http.batch()
-            .GET(tagUrl, HEADERS)
-            .GET(tileUrl, HEADERS)
-            .execute();
+        const [tagResp, tileResp] = batchGET([
+            { url: tagUrl },
+            { url: tileUrl }
+        ]);
 
         // Safe JSON parse helper so a bad response does not crash the channel load
         const safeParse = (resp) => {
@@ -1708,16 +1713,16 @@ function getShowPlaylistDetails(slug) {
     const metadataUrl = `${API_BASE_URL}/feed/en-INT?filter[type]=shows&filter[uriSlug]=${slug}&page[limit]=1&rb3Schema=v1:cardList`;
     const videosUrl = `${API_BASE_URL}/feed/en-INT?filter[type]=shows&filter[uriSlug]=${slug}&page[limit]=1&disableUsageRestrictions=true&rb3Schema=v1:tvEpisodesTabs`;
     
-    const [metadataResp, videosResp] = http.batch()
-        .GET(metadataUrl, HEADERS)
-        .GET(videosUrl, HEADERS)
-        .execute();
-    
+    const [metadataResp, videosResp] = batchGET([
+        { url: metadataUrl },
+        { url: videosUrl }
+    ]);
+
     // Parse metadata
     if (!metadataResp.isOk) {
         throw new ScriptException("Show not found");
     }
-    
+
     let metadataData;
     try {
         metadataData = JSON.parse(metadataResp.body);
@@ -1854,25 +1859,72 @@ function httpGET(options) {
 
     const localHeaders = headers ?? HEADERS;
 
-    const response = http.GET(url, localHeaders, useAuthenticated);
-    
-    if (response.isOk && parseResponse) {
-        try {
-            const parsed = JSON.parse(response.body);
-            // Create a new object to avoid modifying read-only property
-            return {
-                code: response.code,
-                isOk: response.isOk,
-                body: parsed,
-                headers: response.headers
-            };
-        } catch (e) {
-            log("httpGET parse failed: " + formatError(e));
-            // Ignore JSON parse error, return original response
+    function parseResp(response) {
+        if (response.isOk && parseResponse) {
+            try {
+                const parsed = JSON.parse(response.body);
+                return {
+                    code: response.code,
+                    isOk: response.isOk,
+                    body: parsed,
+                    headers: response.headers
+                };
+            } catch (e) {
+                log("httpGET parse failed: " + formatError(e));
+            }
         }
+        return response;
     }
-    
-    return response;
+
+    // Try standard HTTP client first
+    const response = http.GET(url, localHeaders, useAuthenticated);
+    if (response.isOk) {
+        return parseResp(response);
+    }
+
+    // Fall back to httpimp (browser TLS impersonation) on any failure
+    if (IS_IMPERSONATION_AVAILABLE) {
+        log("httpGET falling back to httpimp for: " + url);
+        const impResponse = httpimp.GET(url, localHeaders, useAuthenticated);
+        return parseResp(impResponse);
+    }
+
+    return parseResp(response);
+}
+
+/**
+ * Performs multiple GET requests in parallel using http.batch().
+ * Falls back to sequential httpimp requests if any response fails
+ * (Akamai bot detection can return 403, 429, 503, etc.).
+ *
+ * @param {Array<{url: string, headers?: Object}>} requests - Array of request descriptors
+ * @returns {Array<BridgeHttpResponse>} Array of responses (raw, not JSON-parsed)
+ */
+function batchGET(requests) {
+    // Try http.batch() first
+    let batch = http.batch();
+    for (const req of requests) {
+        batch = batch.GET(req.url, req.headers ?? HEADERS);
+    }
+    const responses = batch.execute();
+
+    // Check if any response failed (bot detection can return 403, 429, 503, etc.)
+    const hasBlock = responses.some(r => !r.isOk);
+
+    if (!hasBlock || !IS_IMPERSONATION_AVAILABLE) {
+        return responses;
+    }
+
+    // Fall back to sequential httpimp requests
+    log("batchGET falling back to httpimp for " + requests.length + " requests");
+    return requests.map(req => {
+        try {
+            return httpimp.GET(req.url, req.headers ?? HEADERS, false);
+        } catch (e) {
+            log("httpimp GET failed: " + formatError(e));
+            return { code: 0, isOk: false, body: "", headers: {} };
+        }
+    });
 }
 
 /**
