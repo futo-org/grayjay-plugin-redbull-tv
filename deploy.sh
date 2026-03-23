@@ -12,7 +12,7 @@ PLUGIN_NAME=${PLUGIN_NAME:?"PLUGIN_NAME environment variable is required"}
 
 # Determine deployment directory
 if [ "$PRE_RELEASE" = "true" ]; then
-    RELATIVE_PATH="pre-release/$PLUGIN_NAME"
+    RELATIVE_PATH="unstable/$PLUGIN_NAME"
 else
     RELATIVE_PATH="$PLUGIN_NAME"
 fi
