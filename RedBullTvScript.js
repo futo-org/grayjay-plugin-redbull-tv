@@ -1710,22 +1710,41 @@ function getShowPlaylistDetails(slug) {
  */
 function extractShowVideos(videosResp) {
     const videos = [];
-    
+
     if (!videosResp.isOk) {
         return videos;
     }
-    
+
     try {
         const videosData = JSON.parse(videosResp.body);
         const seasons = videosData?.data || [];
-        
+
         for (const season of seasons) {
             if (!season.content) {
                 continue;
             }
-            
+
             for (const episode of season.content) {
-                const video = createPlatformVideo(episode);
+                // The tvEpisodesTabs schema stores id/uriSlug/type under a
+                // "reference" object instead of at the top level.  Normalize
+                // these fields so createPlatformVideo can handle the item.
+                const normalized = Object.assign({}, episode);
+                if (episode.reference) {
+                    if (!normalized.id && episode.reference.id) {
+                        normalized.id = episode.reference.id;
+                    }
+                    if (!normalized.type && episode.reference.type) {
+                        normalized.type = episode.reference.type;
+                    }
+                }
+                // Some episodes (especially newly published ones) have
+                // duration 0 across all APIs.  Use -1 (unknown) so
+                // createPlatformVideo doesn't discard them as "coming soon"
+                // content.
+                if (!normalized.duration) {
+                    normalized.duration = -1;
+                }
+                const video = createPlatformVideo(normalized);
                 if (video) {
                     videos.push(video);
                 }
@@ -1735,7 +1754,7 @@ function extractShowVideos(videosResp) {
         log("Failed to parse show videos: " + formatError(e));
         // Ignore parse errors, return empty array
     }
-    
+
     return videos;
 }
 
