@@ -140,6 +140,15 @@ const VIDEO_URL_REGEX = /\/([a-z]{2,3}-[a-z]{2,3})\/videos\/([^\/\?]+)/i;
 const FILM_URL_REGEX = /\/([a-z]{2,3}-[a-z]{2,3})\/films\/([^\/\?]+)/i;
 
 /**
+ * Matches live video URLs and extracts locale and slug.
+ * redbull.com no longer serves these pages, so config/pages returns "Page Not Found".
+ * Captures:
+ *   Group 1: Locale e.g., 'int-en'
+ *   Group 2: Live video slug e.g., 'red-bull-rampage-2026-men'
+ */
+const LIVE_VIDEO_URL_REGEX = /\/([a-z]{2,3}-[a-z]{2,3})\/live\/([^\/\?]+)/i;
+
+/**
  * Parses channel URLs to extract locale, type, and slug.
  * Captures:
  *   Group 1: Locale prefix e.g., 'int-en'
@@ -480,6 +489,11 @@ source.getContentDetails = function(url) {
     const filmsMatch = path.match(FILM_URL_REGEX);
     if (filmsMatch) {
         return getVideoTypeContentDetails(url, filmsMatch[1], filmsMatch[2], 'films', athleteUuid);
+    }
+
+    const liveMatch = path.match(LIVE_VIDEO_URL_REGEX);
+    if (liveMatch) {
+        return getVideoTypeContentDetails(url, liveMatch[1], liveMatch[2], 'live-videos', athleteUuid);
     }
 
     // Fallback: fetch page config for other content types (live events, etc.)
@@ -884,6 +898,8 @@ function getVideoTypeContentDetails(url, urlLocale, slug, contentType, athleteUu
     const thumbnails = createThumbnails(image);
     const duration = item.duration || 0;
     const publishedDate = extractPublishedDate(item);
+    const isLive = contentType === 'live-videos' &&
+                   (item.content?.status === 'live' || item.liveBroadcast?.status === 'live');
 
     // Batch fetch player data and related athlete in parallel for better performance
     // Pass athleteUuid hint to fetch the correct athlete when video has multiple related athletes
@@ -914,7 +930,7 @@ function getVideoTypeContentDetails(url, urlLocale, slug, contentType, athleteUu
         duration: duration,
         viewCount: 0,
         url: url,
-        isLive: false,
+        isLive: isLive,
         description: description,
         subtitles: subtitles,
         video: new VideoSourceDescriptor(sources)
