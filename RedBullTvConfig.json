@@ -5,7 +5,7 @@
   "author": "FUTO",
   "authorUrl": "https://futo.org",
   "platformUrl": "https://www.redbull.com/int-en/discover",
-  "version": 6,
+  "version": 7,
   "iconUrl": "./RedBullTvIcon.png",
   "scriptUrl": "./RedBullTvScript.js",
   "repositoryUrl": "https://gitlab.futo.org/videostreaming/plugins/redbull-tv",
@@ -22,6 +22,9 @@
     ".redbull.com"
   ],
   "changelog": {
+    "7": [
+      "Fix: Live events failing to open from home"
+    ],
     "6": [
       "Fix: Episodes with zero duration no longer filtered from playlists",
       "Fix: Athlete search no longer requests duplicate pages (API ignores pagination)",
